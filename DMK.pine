@@ -1,0 +1,232 @@
+//@version=6
+indicator("DMK", overlay=true, max_labels_count=500)
+
+// DMK v0.3 — standalone signal indicator. Inspired by the user's SMSF Pro
+// Module 1 v1.3 structure semantics; no LIAM or SMSF library dependency.
+// This is a practical signal pilot, not a validated trading strategy.
+
+swingLen       = input.int(5, "Swing bars each side", minval=1, group="Structure")
+atrLen         = input.int(14, "ATR length", minval=1, group="Structure")
+bosBufferMult  = input.float(0.10, "Break buffer × ATR", minval=0, step=0.01, group="Structure")
+maxLevels      = input.int(50, "Protected levels per side", minval=5, maxval=100, group="Structure")
+tieEpsilon     = input.float(0.05, "Ranging dual-break tie (ATR)", minval=0, step=0.01, group="Structure")
+
+minAligned     = input.int(5, "Minimum aligned tiers", minval=4, maxval=6, group="Signals", tooltip="A+ = 6, A = 5, B = 4. Daily, 4H, 1H and Execution always need to agree.")
+allowOpposing  = input.bool(false, "Allow opposing Monthly / Weekly tier", group="Signals", tooltip="Off: an A or B needs any unaligned tier to be Ranging, not pointing against the signal.")
+cooldownBars   = input.int(4, "Minimum chart bars between signals", minval=0, maxval=100, group="Signals")
+use4HLocation  = input.bool(false, "Require 4H half-range pullback", group="Signals", tooltip="Optional proxy location filter: a recent visit to the lower/upper half of the latest protected 4H range. This is not an order block or FVG.")
+touchHours     = input.int(24, "4H pullback valid for hours", minval=1, maxval=168, group="Signals")
+
+showMidpoint   = input.bool(true, "Show 4H midpoint", group="Display")
+showChoch      = input.bool(true, "Show Execution CHoCH warnings", group="Display")
+showDashboard  = input.bool(true, "Show six-tier dashboard", group="Display")
+
+// Trend: -1 bear, 0 range, +1 bull. Event: 0 none, 1 BOS, 2 CHoCH, 3 MSS.
+// Each written function call has independent persistent arrays and state.
+// A new pivot becomes a protected level only after swingLen right bars close.
+f_structure() =>
+    var array<float> activeHighs = array.new<float>()
+    var array<float> activeLows = array.new<float>()
+    var int trend = 0
+    var bool pendingUp = false
+    var bool pendingDown = false
+
+    float atrValue = ta.atr(atrLen)
+    float buffer = bosBufferMult * atrValue
+    float ph = ta.pivothigh(high, swingLen, swingLen)
+    float pl = ta.pivotlow(low, swingLen, swingLen)
+    if not na(ph)
+        array.push(activeHighs, ph)
+        if array.size(activeHighs) > maxLevels
+            array.shift(activeHighs)
+    if not na(pl)
+        array.push(activeLows, pl)
+        if array.size(activeLows) > maxLevels
+            array.shift(activeLows)
+
+    // Collect all close-confirmed same-bar breaks, newest protected level first.
+    bool highBreak = false
+    bool lowBreak = false
+    float primaryHighLevel = na
+    float primaryLowLevel = na
+    if not na(atrValue)
+        int highIndex = array.size(activeHighs) - 1
+        while highIndex >= 0
+            float level = array.get(activeHighs, highIndex)
+            if close > level + buffer
+                array.remove(activeHighs, highIndex)
+                if not highBreak
+                    primaryHighLevel := level
+                highBreak := true
+            highIndex -= 1
+        int lowIndex = array.size(activeLows) - 1
+        while lowIndex >= 0
+            float level = array.get(activeLows, lowIndex)
+            if close < level - buffer
+                array.remove(activeLows, lowIndex)
+                if not lowBreak
+                    primaryLowLevel := level
+                lowBreak := true
+            lowIndex -= 1
+
+    // One primary event per bar. A dual break opposes the existing trend;
+    // in a range, the larger ATR-normalized close displacement wins.
+    int primaryDirection = 0
+    if highBreak and lowBreak
+        if trend == 1
+            primaryDirection := -1
+        else if trend == -1
+            primaryDirection := 1
+        else
+            float upDisp = math.abs(close - primaryHighLevel) / atrValue
+            float downDisp = math.abs(close - primaryLowLevel) / atrValue
+            if math.abs(upDisp - downDisp) > tieEpsilon
+                primaryDirection := upDisp > downDisp ? 1 : -1
+    else if highBreak
+        primaryDirection := 1
+    else if lowBreak
+        primaryDirection := -1
+
+    int eventCode = 0
+    if primaryDirection == 1
+        if trend == -1
+            if pendingUp
+                eventCode := 3
+                trend := 1
+                pendingUp := false
+                pendingDown := false
+            else
+                eventCode := 2
+                pendingUp := true
+        else
+            eventCode := 1
+            trend := 1
+            pendingUp := false
+            pendingDown := false
+    else if primaryDirection == -1
+        if trend == 1
+            if pendingDown
+                eventCode := 3
+                trend := -1
+                pendingUp := false
+                pendingDown := false
+            else
+                eventCode := 2
+                pendingDown := true
+        else
+            eventCode := 1
+            trend := -1
+            pendingUp := false
+            pendingDown := false
+
+    float activeHigh = array.size(activeHighs) > 0 ? array.get(activeHighs, array.size(activeHighs) - 1) : na
+    float activeLow = array.size(activeLows) > 0 ? array.get(activeLows, array.size(activeLows) - 1) : na
+    [trend, eventCode, primaryDirection, activeHigh, activeLow, pendingUp, pendingDown]
+
+// Only the prior completed bar of each native higher timeframe is exposed.
+f_confirmedStructure() =>
+    [t, e, d, h, l, pu, pd] = f_structure()
+    [t[1], h[1], l[1], pu[1], pd[1]]
+
+[trendM, highM, lowM, pendingUpM, pendingDownM] = request.security(syminfo.tickerid, "M", f_confirmedStructure(), lookahead=barmerge.lookahead_on)
+[trendW, highW, lowW, pendingUpW, pendingDownW] = request.security(syminfo.tickerid, "W", f_confirmedStructure(), lookahead=barmerge.lookahead_on)
+[trendD, highD, lowD, pendingUpD, pendingDownD] = request.security(syminfo.tickerid, "D", f_confirmedStructure(), lookahead=barmerge.lookahead_on)
+[trend4H, high4H, low4H, pendingUp4H, pendingDown4H] = request.security(syminfo.tickerid, "240", f_confirmedStructure(), lookahead=barmerge.lookahead_on)
+[trend1H, high1H, low1H, pendingUp1H, pendingDown1H] = request.security(syminfo.tickerid, "60", f_confirmedStructure(), lookahead=barmerge.lookahead_on)
+[trendE, eventE, directionE, highE, lowE, pendingUpE, pendingDownE] = f_structure()
+
+// Validate Execution after native-tier requests so secondary expression slices
+// do not apply the chart-only restriction to Monthly / Weekly / Daily tiers.
+if na(timeframe.in_seconds(timeframe.period)) or timeframe.in_seconds(timeframe.period) >= timeframe.in_seconds("60")
+    runtime.error("DMK needs a time-based chart timeframe below 1H. This chart is the Execution tier.")
+
+int bullCount = (trendM == 1 ? 1 : 0) + (trendW == 1 ? 1 : 0) + (trendD == 1 ? 1 : 0) + (trend4H == 1 ? 1 : 0) + (trend1H == 1 ? 1 : 0) + (trendE == 1 ? 1 : 0)
+int bearCount = (trendM == -1 ? 1 : 0) + (trendW == -1 ? 1 : 0) + (trendD == -1 ? 1 : 0) + (trend4H == -1 ? 1 : 0) + (trend1H == -1 ? 1 : 0) + (trendE == -1 ? 1 : 0)
+bool coreBull = trendD == 1 and trend4H == 1 and trend1H == 1 and trendE == 1
+bool coreBear = trendD == -1 and trend4H == -1 and trend1H == -1 and trendE == -1
+// Waiting optional tiers are not neutral; the override retains its permissive behavior.
+bool optionalTiersReady = not na(trendM) and not na(trendW)
+bool noBullConflict = allowOpposing or (optionalTiersReady and bearCount == 0)
+bool noBearConflict = allowOpposing or (optionalTiersReady and bullCount == 0)
+
+// Optional location proxy. The clock window stays the same on 5m and 45m charts.
+bool valid4HRange = not na(high4H) and not na(low4H) and high4H > low4H
+float mid4H = valid4HRange ? (high4H + low4H) / 2.0 : na
+bool changed4HRange = valid4HRange and (na(high4H[1]) or na(low4H[1]) or high4H != high4H[1] or low4H != low4H[1])
+var int lastDiscountTouch = na
+var int lastPremiumTouch = na
+if changed4HRange
+    lastDiscountTouch := na
+    lastPremiumTouch := na
+if valid4HRange
+    if low <= mid4H and high >= low4H
+        lastDiscountTouch := time
+    if high >= mid4H and low <= high4H
+        lastPremiumTouch := time
+int touchWindowMs = touchHours * 60 * 60 * 1000
+bool longLocation = not use4HLocation or (valid4HRange and not na(lastDiscountTouch) and time - lastDiscountTouch <= touchWindowMs and close > mid4H)
+bool shortLocation = not use4HLocation or (valid4HRange and not na(lastPremiumTouch) and time - lastPremiumTouch <= touchWindowMs and close < mid4H)
+
+var int lastSignalBar = na
+bool cooldownPassed = na(lastSignalBar) or bar_index - lastSignalBar > cooldownBars
+bool confirmedTrigger = barstate.isconfirmed and (eventE == 1 or eventE == 3)
+bool buySignal = confirmedTrigger and directionE == 1 and coreBull and bullCount >= minAligned and noBullConflict and longLocation and cooldownPassed
+bool sellSignal = confirmedTrigger and directionE == -1 and coreBear and bearCount >= minAligned and noBearConflict and shortLocation and cooldownPassed
+if buySignal or sellSignal
+    lastSignalBar := bar_index
+
+bool buyAPlus = buySignal and bullCount == 6
+bool buyA = buySignal and bullCount == 5
+bool buyB = buySignal and bullCount == 4
+bool sellAPlus = sellSignal and bearCount == 6
+bool sellA = sellSignal and bearCount == 5
+bool sellB = sellSignal and bearCount == 4
+
+plot(showMidpoint ? mid4H : na, "4H protected range midpoint", color=color.new(color.orange, 35), linewidth=1, style=plot.style_linebr)
+plotshape(buyAPlus, "A+ Buy", shape.labelup, location.belowbar, color.lime, text="A+ BUY", textcolor=color.black, size=size.tiny)
+plotshape(buyA, "A Buy", shape.labelup, location.belowbar, color.green, text="A BUY", textcolor=color.white, size=size.tiny)
+plotshape(buyB, "B Buy", shape.labelup, location.belowbar, color.teal, text="B BUY", textcolor=color.white, size=size.tiny)
+plotshape(sellAPlus, "A+ Sell", shape.labeldown, location.abovebar, color.red, text="A+ SELL", textcolor=color.white, size=size.tiny)
+plotshape(sellA, "A Sell", shape.labeldown, location.abovebar, color.maroon, text="A SELL", textcolor=color.white, size=size.tiny)
+plotshape(sellB, "B Sell", shape.labeldown, location.abovebar, color.orange, text="B SELL", textcolor=color.white, size=size.tiny)
+plotshape(showChoch and barstate.isconfirmed and eventE == 2 and directionE == 1, "Bullish CHoCH warning", shape.triangleup, location.belowbar, color.new(color.orange, 20), text="CH", textcolor=color.orange, size=size.tiny)
+plotshape(showChoch and barstate.isconfirmed and eventE == 2 and directionE == -1, "Bearish CHoCH warning", shape.triangledown, location.abovebar, color.new(color.orange, 20), text="CH", textcolor=color.orange, size=size.tiny)
+
+alertcondition(buyAPlus, "DMK A+ Buy", "DMK A+ BUY: 6/6 aligned; confirmed Execution BOS or MSS")
+alertcondition(buyA, "DMK A Buy", "DMK A BUY: 5/6 aligned; confirmed Execution BOS or MSS")
+alertcondition(buyB, "DMK B Buy", "DMK B BUY: 4/6 aligned; confirmed Execution BOS or MSS")
+alertcondition(sellAPlus, "DMK A+ Sell", "DMK A+ SELL: 6/6 aligned; confirmed Execution BOS or MSS")
+alertcondition(sellA, "DMK A Sell", "DMK A SELL: 5/6 aligned; confirmed Execution BOS or MSS")
+alertcondition(sellB, "DMK B Sell", "DMK B SELL: 4/6 aligned; confirmed Execution BOS or MSS")
+alertcondition(buySignal or sellSignal, "DMK Any Signal", "DMK signal: check chart for direction and grade")
+
+f_trendText(int t, bool pu, bool pd) =>
+    na(t) ? "Waiting" : pu ? "Bear / CH↑" : pd ? "Bull / CH↓" : t == 1 ? "Bull" : t == -1 ? "Bear" : "Range"
+
+f_tierColor(int t, bool pu, bool pd) =>
+    pu or pd ? color.orange : t == 1 ? color.lime : t == -1 ? color.red : color.silver
+
+var table dash = table.new(position.top_right, 2, 11, bgcolor=color.new(color.black, 12), frame_color=color.new(color.gray, 60), frame_width=1)
+if showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "DMK", text_color=color.white, bgcolor=color.new(color.navy, 10))
+    table.cell(dash, 1, 0, "Six-tier signals", text_color=color.white, bgcolor=color.new(color.navy, 10))
+    table.cell(dash, 0, 1, "Monthly", text_color=color.white)
+    table.cell(dash, 1, 1, f_trendText(trendM, pendingUpM, pendingDownM), text_color=f_tierColor(trendM, pendingUpM, pendingDownM))
+    table.cell(dash, 0, 2, "Weekly", text_color=color.white)
+    table.cell(dash, 1, 2, f_trendText(trendW, pendingUpW, pendingDownW), text_color=f_tierColor(trendW, pendingUpW, pendingDownW))
+    table.cell(dash, 0, 3, "Daily", text_color=color.white)
+    table.cell(dash, 1, 3, f_trendText(trendD, pendingUpD, pendingDownD), text_color=f_tierColor(trendD, pendingUpD, pendingDownD))
+    table.cell(dash, 0, 4, "4H", text_color=color.white)
+    table.cell(dash, 1, 4, f_trendText(trend4H, pendingUp4H, pendingDown4H), text_color=f_tierColor(trend4H, pendingUp4H, pendingDown4H))
+    table.cell(dash, 0, 5, "1H", text_color=color.white)
+    table.cell(dash, 1, 5, f_trendText(trend1H, pendingUp1H, pendingDown1H), text_color=f_tierColor(trend1H, pendingUp1H, pendingDown1H))
+    table.cell(dash, 0, 6, "Execution", text_color=color.white)
+    table.cell(dash, 1, 6, f_trendText(trendE, pendingUpE, pendingDownE), text_color=f_tierColor(trendE, pendingUpE, pendingDownE))
+    table.cell(dash, 0, 7, "Bull / Bear", text_color=color.white)
+    table.cell(dash, 1, 7, str.tostring(bullCount) + " / " + str.tostring(bearCount), text_color=color.white)
+    table.cell(dash, 0, 8, "Min / conflict", text_color=color.white)
+    table.cell(dash, 1, 8, str.tostring(minAligned) + " / " + (allowOpposing ? "allowed" : "blocked"), text_color=color.white)
+    table.cell(dash, 0, 9, "4H location", text_color=color.white)
+    table.cell(dash, 1, 9, not use4HLocation ? "Off" : not valid4HRange ? "No range" : longLocation ? "Long valid" : shortLocation ? "Short valid" : "Need pullback", text_color=color.white)
+    table.cell(dash, 0, 10, "Execution event", text_color=color.white)
+    table.cell(dash, 1, 10, eventE == 1 ? "BOS" : eventE == 2 ? "CHoCH" : eventE == 3 ? "MSS" : "—", text_color=color.white)

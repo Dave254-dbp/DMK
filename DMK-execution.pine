@@ -1,0 +1,755 @@
+//@version=6
+indicator("DMK Execution", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// DMK Execution v0.4: Sweep -> later structural MSS -> confirmed FVG -> future retest.
+// Reference-level retest audit: no inferred fills when a gap skips the entry price.
+// OHLC evidence cannot certify broker fills, spread, slippage, or intrabar event order.
+// Grade measures agreement/evidence, never a success probability or realized return.
+// DMK.pine remains the separate legacy six-tier signal indicator.
+swingLen = input.int(5, "Swing bars each side", minval=1, group="Structure")
+atrLen = input.int(14, "ATR length", minval=1, group="Structure")
+bosBufferMult = input.float(0.10, "Break buffer × ATR", minval=0, step=0.01, group="Structure")
+maxLevels = input.int(50, "Protected levels per side", minval=5, maxval=100, group="Structure")
+tieEpsilon = input.float(0.05, "Ranging dual-break tie (ATR)", minval=0, step=0.01, group="Structure")
+minAligned = input.int(5, "Minimum aligned tiers", minval=4, maxval=6, group="Qualification", tooltip="6=A+, 5=A, 4=B. Set 4 to enable B. All six tiers must be initialized; Daily/4H/1H/Execution must agree.")
+allowOpposing = input.bool(false, "Allow opposing Monthly / Weekly tier", group="Qualification")
+entryPolicy = input.string("Midpoint", "FVG entry", options=["Midpoint", "Near edge"], group="Execution")
+targetPolicy = input.string("Nearest untouched liquidity", "Liquidity target", options=["Nearest untouched liquidity", "PDH / PDL only"], group="Execution")
+stopTicks = input.int(1, "Stop beyond sweep extreme (ticks)", minval=1, group="Execution")
+sequenceBars = input.int(24, "Sweep-to-FVG maximum bars", minval=2, maxval=500, group="Execution")
+expiryBars = input.int(24, "Pending order valid future bars", minval=1, maxval=500, group="Execution")
+useBreakeven = input.bool(false, "Enable breakeven after confirmed MFE", group="Execution")
+breakevenAfterR = input.float(1, "Breakeven threshold R (next bar only)", minval=0.1, step=0.1, group="Execution")
+maxConcurrent = input.int(200, "Concurrent records (error at capacity)", minval=10, maxval=1000, group="Audit limits")
+showLevels = input.bool(true, "Show execution levels", group="Display")
+showRReferences = input.bool(false, "Show 1R / 2R / 3R references", group="Display", tooltip="Informational references; exits use actual selected liquidity, not these prices.")
+showDashboard = input.bool(true, "Show dashboards", group="Display")
+visibleSetups = input.int(50, "Recent setups drawn", minval=1, maxval=80, group="Display", tooltip="Only drawings are capped (max 480 lines / 320 labels with references). Audit totals include every qualified setup.")
+auditTimezone = input.string("Africa/Nairobi", "Evidence display timezone", group="Display")
+
+// Trend: -1 bear, 0 range, +1 bull. Event: 0 none, 1 BOS, 2 CHoCH, 3 MSS.
+// Each written function call has independent persistent arrays and state.
+// A new pivot becomes a protected level only after swingLen right bars close.
+f_structure() =>
+    var array<float> activeHighs = array.new<float>()
+    var array<float> activeLows = array.new<float>()
+    var int trend = 0
+    var bool pendingUp = false
+    var bool pendingDown = false
+
+    float atrValue = ta.atr(atrLen)
+    float buffer = bosBufferMult * atrValue
+    float ph = ta.pivothigh(high, swingLen, swingLen)
+    float pl = ta.pivotlow(low, swingLen, swingLen)
+    if not na(ph)
+        array.push(activeHighs, ph)
+        if array.size(activeHighs) > maxLevels
+            array.shift(activeHighs)
+    if not na(pl)
+        array.push(activeLows, pl)
+        if array.size(activeLows) > maxLevels
+            array.shift(activeLows)
+
+    // Collect all close-confirmed same-bar breaks, newest protected level first.
+    bool highBreak = false
+    bool lowBreak = false
+    float primaryHighLevel = na
+    float primaryLowLevel = na
+    if not na(atrValue)
+        int highIndex = array.size(activeHighs) - 1
+        while highIndex >= 0
+            float level = array.get(activeHighs, highIndex)
+            if close > level + buffer
+                array.remove(activeHighs, highIndex)
+                if not highBreak
+                    primaryHighLevel := level
+                highBreak := true
+            highIndex -= 1
+        int lowIndex = array.size(activeLows) - 1
+        while lowIndex >= 0
+            float level = array.get(activeLows, lowIndex)
+            if close < level - buffer
+                array.remove(activeLows, lowIndex)
+                if not lowBreak
+                    primaryLowLevel := level
+                lowBreak := true
+            lowIndex -= 1
+
+    // One primary event per bar. A dual break opposes the existing trend;
+    // in a range, the larger ATR-normalized close displacement wins.
+    int primaryDirection = 0
+    if highBreak and lowBreak
+        if trend == 1
+            primaryDirection := -1
+        else if trend == -1
+            primaryDirection := 1
+        else
+            float upDisp = math.abs(close - primaryHighLevel) / atrValue
+            float downDisp = math.abs(close - primaryLowLevel) / atrValue
+            if math.abs(upDisp - downDisp) > tieEpsilon
+                primaryDirection := upDisp > downDisp ? 1 : -1
+    else if highBreak
+        primaryDirection := 1
+    else if lowBreak
+        primaryDirection := -1
+
+    int eventCode = 0
+    if primaryDirection == 1
+        if trend == -1
+            if pendingUp
+                eventCode := 3
+                trend := 1
+                pendingUp := false
+                pendingDown := false
+            else
+                eventCode := 2
+                pendingUp := true
+        else
+            eventCode := 1
+            trend := 1
+            pendingUp := false
+            pendingDown := false
+    else if primaryDirection == -1
+        if trend == 1
+            if pendingDown
+                eventCode := 3
+                trend := -1
+                pendingUp := false
+                pendingDown := false
+            else
+                eventCode := 2
+                pendingDown := true
+        else
+            eventCode := 1
+            trend := -1
+            pendingUp := false
+            pendingDown := false
+
+    float activeHigh = array.size(activeHighs) > 0 ? array.get(activeHighs, array.size(activeHighs) - 1) : na
+    float activeLow = array.size(activeLows) > 0 ? array.get(activeLows, array.size(activeLows) - 1) : na
+    [trend, eventCode, primaryDirection, activeHigh, activeLow, pendingUp, pendingDown]
+
+// Only the prior completed bar of each native higher timeframe is exposed.
+f_confirmedStructure() =>
+    [t, e, d, h, l, pu, pd] = f_structure()
+    [t[1], h[1], l[1], pu[1], pd[1]]
+
+[trendM, highM, lowM, pendingUpM, pendingDownM] = request.security(syminfo.tickerid, "M", f_confirmedStructure(), lookahead=barmerge.lookahead_on)
+[trendW, highW, lowW, pendingUpW, pendingDownW] = request.security(syminfo.tickerid, "W", f_confirmedStructure(), lookahead=barmerge.lookahead_on)
+[trendD, highD, lowD, pendingUpD, pendingDownD] = request.security(syminfo.tickerid, "D", f_confirmedStructure(), lookahead=barmerge.lookahead_on)
+[trend4H, high4H, low4H, pendingUp4H, pendingDown4H] = request.security(syminfo.tickerid, "240", f_confirmedStructure(), lookahead=barmerge.lookahead_on)
+[trend1H, high1H, low1H, pendingUp1H, pendingDown1H] = request.security(syminfo.tickerid, "60", f_confirmedStructure(), lookahead=barmerge.lookahead_on)
+[trendE, eventE, directionE, highE, lowE, pendingUpE, pendingDownE] = f_structure()
+
+
+// Previous-day liquidity comes from the completed native daily bar, not inferred UTC dates.
+f_previousDay() =>
+    // Current native open is already known. Prices remain the completed [1] bar.
+    [high[1], low[1], time]
+[pdh, pdl, previousDayKnownAt] = request.security(syminfo.tickerid, "D", f_previousDay(), lookahead=barmerge.lookahead_on)
+
+// Keep primary-chart validation after native requests for PineTS expression slicing.
+if na(timeframe.in_seconds(timeframe.period)) or timeframe.in_seconds(timeframe.period) >= timeframe.in_seconds("60")
+    runtime.error("DMK Execution needs a time-based chart below 1H.")
+
+int bullCount = (trendM == 1 ? 1 : 0) + (trendW == 1 ? 1 : 0) + (trendD == 1 ? 1 : 0) + (trend4H == 1 ? 1 : 0) + (trend1H == 1 ? 1 : 0) + (trendE == 1 ? 1 : 0)
+int bearCount = (trendM == -1 ? 1 : 0) + (trendW == -1 ? 1 : 0) + (trendD == -1 ? 1 : 0) + (trend4H == -1 ? 1 : 0) + (trend1H == -1 ? 1 : 0) + (trendE == -1 ? 1 : 0)
+bool allTiersKnown = not na(trendM) and not na(trendW) and not na(trendD) and not na(trend4H) and not na(trend1H) and not na(trendE)
+bool coreBull = trendD == 1 and trend4H == 1 and trend1H == 1 and trendE == 1
+bool coreBear = trendD == -1 and trend4H == -1 and trend1H == -1 and trendE == -1
+bool qualifyLong = allTiersKnown and coreBull and bullCount >= minAligned and (allowOpposing or bearCount == 0)
+bool qualifyShort = allTiersKnown and coreBear and bearCount >= minAligned and (allowOpposing or bullCount == 0)
+
+// Raw swing liquidity is consumed by WICKS, separately from legacy close-break state.
+type Liquidity
+    float price = na
+    int knownAt = na
+
+type Sequence
+    int dir = 0
+    int sweepBar = na
+    int sweepTime = na
+    float sweepLevel = na
+    int sweepKnownAt = na
+    string sweepName = ""
+    float extreme = na
+    float mssLevel = na
+    int mssLevelKnownAt = na
+    int mssBar = na
+    int mssTime = na
+    float zoneLow = na
+    float zoneHigh = na
+    int fvgTime = na
+
+type Execution
+    int id = na
+    int dir = 0
+    int grade = 0
+    int score = 0
+    int armedBar = na
+    int armedTime = na
+    int sweepTime = na
+    float sweepLevel = na
+    int sweepKnownAt = na
+    string sweepName = ""
+    float sweepExtreme = na
+    float mssLevel = na
+    int mssLevelKnownAt = na
+    int mssTime = na
+    float zoneLow = na
+    float zoneHigh = na
+    int fvgTime = na
+    float entry = na
+    float stop = na
+    float target = na
+    string targetName = ""
+    int targetKnownAt = na
+    float risk = na
+    float rr = na
+    string tiersAtArming = ""
+    int state = 0
+    int triggered = 0
+    int entryBar = na
+    int entryTime = na
+    int entryFrom = na
+    int entryTo = na
+    int outcome = 0
+    int outcomeTime = na
+    int outcomeFrom = na
+    int outcomeTo = na
+    float mfeLower = 0
+    float mfeUpper = 0
+    bool beActive = false
+    line entryLine = na
+    line stopLine = na
+    line targetLine = na
+    line r1Line = na
+    line r2Line = na
+    line r3Line = na
+    label entryLabel = na
+    label stopLabel = na
+    label targetLabel = na
+    label detailLabel = na
+
+// Outcomes: 0 pending/open, 1 WIN, 2 LOSS, 3 BE, 4 INVALIDATED,
+// 5 NOT TRIGGERED, 6 AMBIGUOUS. triggered: 0 no, 1 yes, 2 unknown.
+f_grade(int count) =>
+    count == 6 ? "A+" : count == 5 ? "A" : "B"
+f_outcome(Execution s) =>
+    s.outcome == 1 ? "WIN" : s.outcome == 2 ? "LOSS" : s.outcome == 3 ? "BE" : s.outcome == 4 ? "INVALIDATED" : s.outcome == 5 ? "NOT TRIGGERED" : s.outcome == 6 ? "AMBIGUOUS" : s.state == 1 ? "OPEN" : "WAIT"
+f_time(int value) =>
+    na(value) ? "unknown" : str.format_time(value, "yyyy-MM-dd HH:mm:ss", auditTimezone)
+f_tierSnapshot(int trend, bool pendingUp, bool pendingDown) =>
+    str.tostring(trend) + (pendingUp ? "/CHup" : pendingDown ? "/CHdown" : "")
+f_r(Execution s, float price) =>
+    s.dir * (price - s.entry) / s.risk
+f_favorable(Execution s) =>
+    math.max(0, f_r(s, s.dir == 1 ? high : low))
+f_bounds(Execution s, float lower, float upper) =>
+    s.mfeLower := math.max(s.mfeLower, math.min(s.rr, math.max(0, lower)))
+    s.mfeUpper := math.max(s.mfeUpper, math.min(s.rr, math.max(0, upper)), s.mfeLower)
+f_finish(Execution s, int outcome, bool exactOpen) =>
+    s.outcome := outcome
+    s.outcomeTime := exactOpen ? time : na
+    s.outcomeFrom := time
+    s.outcomeTo := exactOpen ? time : time_close
+f_enter(Execution s, bool exactOpen) =>
+    s.state := 1
+    s.triggered := 1
+    s.entryBar := bar_index
+    s.entryTime := exactOpen ? time : na
+    s.entryFrom := time
+    s.entryTo := exactOpen ? time : time_close
+
+// Audit step evaluator. Formation-bar prices cannot fill a newly armed order.
+// A retest candle spanning entry and exits is ambiguous, never silently stop-first.
+f_evaluate(Execution s) =>
+    float activeStop = s.beActive ? s.entry : s.stop
+    bool stopTouch = s.dir == 1 ? low <= activeStop : high >= activeStop
+    bool targetTouch = s.dir == 1 ? high >= s.target : low <= s.target
+    bool stopAtOpen = s.dir * (open - activeStop) <= 0
+    bool targetAtOpen = s.dir * (open - s.target) >= 0
+    bool entryTouch = low <= s.entry and high >= s.entry
+    if s.state == 0 and s.outcome == 0 and bar_index > s.armedBar
+        if open == s.entry
+            f_enter(s, true)
+        else if stopAtOpen or targetAtOpen
+            f_finish(s, 4, true)
+        else if entryTouch and (stopTouch or targetTouch)
+            s.triggered := 2
+            s.entryFrom := time
+            s.entryTo := time_close
+            f_bounds(s, 0, f_favorable(s))
+            f_finish(s, 6, false)
+        else if not entryTouch and (stopTouch or targetTouch)
+            f_finish(s, 4, false)
+        else if entryTouch
+            f_enter(s, false)
+    if s.state == 1 and s.outcome == 0 and bar_index > s.armedBar
+        // Only confirmed favorable evidence from a PREVIOUS bar can activate BE.
+        if useBreakeven and not s.beActive and bar_index > s.entryBar and s.mfeLower >= breakevenAfterR
+            s.beActive := true
+            activeStop := s.entry
+            stopTouch := s.dir == 1 ? low <= activeStop : high >= activeStop
+            stopAtOpen := s.dir * (open - activeStop) <= 0
+        bool intrabarEntry = s.entryBar == bar_index and na(s.entryTime)
+        int stoppedOutcome = s.beActive ? 3 : 2
+        if not intrabarEntry and stopAtOpen
+            f_finish(s, stoppedOutcome, true)
+        else if not intrabarEntry and targetAtOpen
+            f_bounds(s, s.rr, s.rr)
+            f_finish(s, 1, true)
+        else if stopTouch and targetTouch
+            f_bounds(s, intrabarEntry ? 0 : math.max(0, f_r(s, open)), s.rr)
+            f_finish(s, 6, false)
+        else if targetTouch
+            f_bounds(s, s.rr, s.rr)
+            f_finish(s, 1, false)
+        else if stopTouch
+            f_bounds(s, intrabarEntry ? 0 : math.max(0, f_r(s, open)), f_favorable(s))
+            f_finish(s, stoppedOutcome, false)
+        else
+            f_bounds(s, intrabarEntry ? math.max(0, f_r(s, close)) : f_favorable(s), f_favorable(s))
+    if s.state == 0 and s.outcome == 0 and bar_index - s.armedBar >= expiryBars
+        s.outcome := 5
+        s.outcomeTime := time_close
+        s.outcomeFrom := time_close
+        s.outcomeTo := time_close
+    s.outcome
+
+f_detail(Execution s) =>
+    string entryTimeText = s.triggered == 0 ? "not entered" : s.triggered == 2 ? "ENTRY ORDER UNKNOWN" : na(s.entryTime) ? f_time(s.entryFrom) + " to " + f_time(s.entryTo) : f_time(s.entryTime) + " (open)"
+    string mfeText = s.triggered == 0 ? "n/a" : str.tostring(s.mfeLower, "#.##") + ".." + str.tostring(s.mfeUpper, "#.##") + "R" + (s.triggered == 2 ? " if entered" : "")
+    string outcomeTimeText = s.outcome == 0 ? "" : "\nOutcome time " + (na(s.outcomeTime) ? f_time(s.outcomeFrom) + " to " + f_time(s.outcomeTo) : f_time(s.outcomeTime) + " (known boundary)")
+    "#" + str.tostring(s.id) + " " + f_grade(s.grade) + (s.dir == 1 ? " LONG " : " SHORT ") + f_outcome(s) + "\nAligned " + str.tostring(s.score) + "/6; sweep/MSS/FVG confirmed (not odds)\nFrozen tiers " + s.tiersAtArming + "\nSweep " + s.sweepName + " " + f_time(s.sweepTime) + "\nMSS close through " + str.tostring(s.mssLevel, format.mintick) + " " + f_time(s.mssTime) + "\nFVG " + str.tostring(s.zoneLow, format.mintick) + ".." + str.tostring(s.zoneHigh, format.mintick) + " " + f_time(s.fvgTime) + "\nArmed " + f_time(s.armedTime) + "\nENTRY " + str.tostring(s.entry, format.mintick) + " SL " + str.tostring(s.stop, format.mintick) + " TP " + str.tostring(s.target, format.mintick) + "\nActive SL " + str.tostring(s.beActive ? s.entry : s.stop, format.mintick) + "\nEntry time " + entryTimeText + "\nRisk " + str.tostring(s.risk, format.mintick) + " price / " + str.tostring(s.risk / syminfo.mintick, "#.##") + " ticks / " + str.tostring(100 * s.risk / s.entry, "#.###") + "% quote\nTarget " + s.targetName + " known " + f_time(s.targetKnownAt) + " RR " + str.tostring(s.rr, "#.##") + (s.outcome == 1 ? " REACHED" : "") + "\nMFE " + mfeText + outcomeTimeText + "\n" + auditTimezone + "; OHLC/no costs"
+
+f_compact(Execution s) =>
+    "#" + str.tostring(s.id) + " " + f_grade(s.grade) + (s.dir == 1 ? " LONG " : " SHORT ") + f_outcome(s) + "\n" + str.tostring(s.score) + "/6 RR " + str.tostring(s.rr, "#.##")
+
+f_draw(Execution s) =>
+    s.entryLine := line.new(s.armedBar, s.entry, s.armedBar + 1, s.entry, extend=extend.right, color=color.blue, width=2)
+    s.stopLine := line.new(s.armedBar, s.stop, s.armedBar + 1, s.stop, extend=extend.right, color=color.red, width=2)
+    s.targetLine := line.new(s.armedBar, s.target, s.armedBar + 1, s.target, extend=extend.right, color=color.lime, width=2)
+    s.entryLabel := label.new(s.armedBar + 1, s.entry, "Limit " + str.tostring(s.entry, format.mintick), style=label.style_label_left, color=color.blue, textcolor=color.white, size=size.tiny)
+    s.stopLabel := label.new(s.armedBar + 1, s.stop, "SL " + str.tostring(s.stop, format.mintick), style=label.style_label_left, color=color.red, textcolor=color.white, size=size.tiny)
+    s.targetLabel := label.new(s.armedBar + 1, s.target, "TP " + s.targetName + " " + str.tostring(s.target, format.mintick), style=label.style_label_left, color=color.green, textcolor=color.white, size=size.tiny)
+    s.detailLabel := label.new(s.armedBar, s.dir == 1 ? s.stop : s.target, f_compact(s), style=label.style_label_up, color=color.new(color.black, 15), textcolor=color.white, size=size.tiny)
+    label.set_tooltip(s.detailLabel, f_detail(s))
+    if showRReferences
+        s.r1Line := line.new(s.armedBar, s.entry + s.dir * s.risk, s.armedBar + 1, s.entry + s.dir * s.risk, extend=extend.right, color=color.new(color.gray, 70), style=line.style_dotted)
+        s.r2Line := line.new(s.armedBar, s.entry + s.dir * 2 * s.risk, s.armedBar + 1, s.entry + s.dir * 2 * s.risk, extend=extend.right, color=color.new(color.gray, 70), style=line.style_dotted)
+        s.r3Line := line.new(s.armedBar, s.entry + s.dir * 3 * s.risk, s.armedBar + 1, s.entry + s.dir * 3 * s.risk, extend=extend.right, color=color.new(color.gray, 70), style=line.style_dotted)
+f_deleteDrawing(Execution s) =>
+    line.delete(s.entryLine)
+    line.delete(s.stopLine)
+    line.delete(s.targetLine)
+    line.delete(s.r1Line)
+    line.delete(s.r2Line)
+    line.delete(s.r3Line)
+    label.delete(s.entryLabel)
+    label.delete(s.stopLabel)
+    label.delete(s.targetLabel)
+    label.delete(s.detailLabel)
+    s.entryLine := na
+    s.stopLine := na
+    s.targetLine := na
+    s.r1Line := na
+    s.r2Line := na
+    s.r3Line := na
+    s.entryLabel := na
+    s.stopLabel := na
+    s.targetLabel := na
+    s.detailLabel := na
+f_refreshDrawing(Execution s) =>
+    if not na(s.detailLabel)
+        label.set_text(s.detailLabel, f_compact(s))
+        label.set_tooltip(s.detailLabel, f_detail(s))
+        label.set_color(s.detailLabel, s.outcome == 2 ? color.new(color.red, 20) : s.outcome == 1 ? color.new(color.green, 20) : color.new(color.black, 15))
+    if not na(s.entryLabel) and s.triggered == 1
+        label.set_x(s.entryLabel, s.entryBar)
+        label.set_text(s.entryLabel, "ENTRY " + str.tostring(s.entry, format.mintick) + "\n" + (na(s.entryTime) ? f_time(s.entryFrom) + " to " + f_time(s.entryTo) : f_time(s.entryTime) + " (open)"))
+    if not na(s.entryLabel) and s.triggered == 2
+        label.set_text(s.entryLabel, "LIMIT " + str.tostring(s.entry, format.mintick) + "\nENTRY ORDER UNKNOWN")
+    if not na(s.targetLabel) and s.outcome == 1
+        label.set_text(s.targetLabel, "TP REACHED " + s.targetName + " " + str.tostring(s.target, format.mintick))
+    if not na(s.stopLabel) and s.beActive
+        label.set_y(s.stopLabel, s.entry)
+        label.set_text(s.stopLabel, "BE SL " + str.tostring(s.entry, format.mintick))
+        line.set_y1(s.stopLine, s.entry)
+        line.set_y2(s.stopLine, s.entry)
+    if s.outcome != 0 and not na(s.entryLine)
+        line.set_x2(s.entryLine, bar_index)
+        line.set_x2(s.stopLine, bar_index)
+        line.set_x2(s.targetLine, bar_index)
+        line.set_extend(s.entryLine, extend.none)
+        line.set_extend(s.stopLine, extend.none)
+        line.set_extend(s.targetLine, extend.none)
+        if not na(s.r1Line)
+            line.set_x2(s.r1Line, bar_index)
+            line.set_x2(s.r2Line, bar_index)
+            line.set_x2(s.r3Line, bar_index)
+            line.set_extend(s.r1Line, extend.none)
+            line.set_extend(s.r2Line, extend.none)
+            line.set_extend(s.r3Line, extend.none)
+
+var array<Liquidity> upperPool = array.new<Liquidity>()
+var array<Liquidity> lowerPool = array.new<Liquidity>()
+// MSS catalogs retain wick-consumed pivots until a CONFIRMED CLOSE breaks them.
+var array<Liquidity> upperStructure = array.new<Liquidity>()
+var array<Liquidity> lowerStructure = array.new<Liquidity>()
+var array<Sequence> sequences = array.new<Sequence>()
+var array<Execution> tracked = array.new<Execution>()
+var array<Execution> drawn = array.new<Execution>()
+var array<int> qualified = array.new<int>(3, 0)
+var array<int> entered = array.new<int>(3, 0)
+var array<int> uncertainEntry = array.new<int>(3, 0)
+var array<int> terminals = array.new<int>(18, 0)
+var int dayKnownAt = na
+var bool pdhTaken = false
+var bool pdlTaken = false
+var int nextId = 0
+var Execution latest = Execution.new()
+float rawPivotHigh = ta.pivothigh(high, swingLen, swingLen)
+float rawPivotLow = ta.pivotlow(low, swingLen, swingLen)
+bool bullishFvg = not na(high[2]) and low > high[2]
+bool bearishFvg = not na(low[2]) and high < low[2]
+int armedLongGrade = 0
+int armedShortGrade = 0
+
+if barstate.isconfirmed
+    // Score every existing order before recognizing today's new formations.
+    int orderIndex = array.size(tracked) - 1
+    while orderIndex >= 0
+        Execution s = array.get(tracked, orderIndex)
+        int beforeTriggered = s.triggered
+        if bar_index > s.armedBar
+            f_evaluate(s)
+        int gradeIndex = s.grade - 4
+        if beforeTriggered == 0 and s.triggered == 1
+            array.set(entered, gradeIndex, array.get(entered, gradeIndex) + 1)
+        if beforeTriggered == 0 and s.triggered == 2
+            array.set(uncertainEntry, gradeIndex, array.get(uncertainEntry, gradeIndex) + 1)
+        f_refreshDrawing(s)
+        if s.outcome != 0
+            int bucket = gradeIndex * 6 + s.outcome - 1
+            array.set(terminals, bucket, array.get(terminals, bucket) + 1)
+            array.remove(tracked, orderIndex)
+        orderIndex -= 1
+
+    if na(dayKnownAt)
+        dayKnownAt := previousDayKnownAt
+        // Initial partial-day history cannot prove that PDH/PDL are untouched.
+        pdhTaken := time != previousDayKnownAt
+        pdlTaken := time != previousDayKnownAt
+    else if previousDayKnownAt != dayKnownAt
+        dayKnownAt := previousDayKnownAt
+        pdhTaken := false
+        pdlTaken := false
+    // Snapshot prior confirmed pivots; a pivot confirmed at this close was not
+    // available before this bar's sweep wick and cannot retroactively prove it.
+    float oppositeHigh = na
+    int oppositeHighKnownAt = na
+    float oppositeLow = na
+    int oppositeLowKnownAt = na
+    int structureIndex = array.size(upperStructure) - 1
+    while structureIndex >= 0
+        Liquidity level = array.get(upperStructure, structureIndex)
+        if na(oppositeHigh) and level.price > close and level.knownAt <= time
+            oppositeHigh := level.price
+            oppositeHighKnownAt := level.knownAt
+        if close > level.price
+            array.remove(upperStructure, structureIndex)
+        structureIndex -= 1
+    structureIndex := array.size(lowerStructure) - 1
+    while structureIndex >= 0
+        Liquidity level = array.get(lowerStructure, structureIndex)
+        if na(oppositeLow) and level.price < close and level.knownAt <= time
+            oppositeLow := level.price
+            oppositeLowKnownAt := level.knownAt
+        if close < level.price
+            array.remove(lowerStructure, structureIndex)
+        structureIndex -= 1
+    float sweepLowLevel = not pdlTaken and not na(pdl) and low < pdl and close > pdl ? pdl : na
+    int sweepLowKnownAt = not na(sweepLowLevel) ? previousDayKnownAt : na
+    string sweepLowName = not na(sweepLowLevel) ? "PDL" : ""
+    float sweepHighLevel = not pdhTaken and not na(pdh) and high > pdh and close < pdh ? pdh : na
+    int sweepHighKnownAt = not na(sweepHighLevel) ? previousDayKnownAt : na
+    string sweepHighName = not na(sweepHighLevel) ? "PDH" : ""
+    int liquidityIndex = array.size(lowerPool) - 1
+    while liquidityIndex >= 0
+        Liquidity level = array.get(lowerPool, liquidityIndex)
+        if (na(sweepLowLevel) or level.knownAt > sweepLowKnownAt) and low < level.price and close > level.price
+            sweepLowLevel := level.price
+            sweepLowKnownAt := level.knownAt
+            sweepLowName := "Execution swing low"
+        if low <= level.price
+            array.remove(lowerPool, liquidityIndex)
+        liquidityIndex -= 1
+    liquidityIndex := array.size(upperPool) - 1
+    while liquidityIndex >= 0
+        Liquidity level = array.get(upperPool, liquidityIndex)
+        if (na(sweepHighLevel) or level.knownAt > sweepHighKnownAt) and high > level.price and close < level.price
+            sweepHighLevel := level.price
+            sweepHighKnownAt := level.knownAt
+            sweepHighName := "Execution swing high"
+        if high >= level.price
+            array.remove(upperPool, liquidityIndex)
+        liquidityIndex -= 1
+    if not na(pdh) and high >= pdh
+        pdhTaken := true
+    if not na(pdl) and low <= pdl
+        pdlTaken := true
+    // New confirmations are usable for targets at this close, but not this sweep.
+    if not na(rawPivotHigh) and high < rawPivotHigh
+        if array.size(upperPool) >= 1000
+            runtime.error("Upper liquidity catalog reached 1000. Audit stopped; no levels silently discarded.")
+        array.push(upperPool, Liquidity.new(rawPivotHigh, time_close))
+    if not na(rawPivotLow) and low > rawPivotLow
+        if array.size(lowerPool) >= 1000
+            runtime.error("Lower liquidity catalog reached 1000. Audit stopped; no levels silently discarded.")
+        array.push(lowerPool, Liquidity.new(rawPivotLow, time_close))
+    if not na(rawPivotHigh) and close <= rawPivotHigh
+        if array.size(upperStructure) >= 1000
+            runtime.error("Upper MSS catalog reached 1000. No structural level was silently discarded.")
+        array.push(upperStructure, Liquidity.new(rawPivotHigh, time_close))
+    if not na(rawPivotLow) and close >= rawPivotLow
+        if array.size(lowerStructure) >= 1000
+            runtime.error("Lower MSS catalog reached 1000. No structural level was silently discarded.")
+        array.push(lowerStructure, Liquidity.new(rawPivotLow, time_close))
+
+    // One unresolved sequence per direction. A newer valid sweep supersedes it
+    // before arming; already armed orders are never superseded or netted.
+    bool longSweep = not na(sweepLowLevel) and not na(oppositeHigh)
+    bool shortSweep = not na(sweepHighLevel) and not na(oppositeLow)
+    bool bothSweeps = not na(sweepLowLevel) and not na(sweepHighLevel)
+    if not bothSweeps and (longSweep or shortSweep)
+        int newDirection = longSweep ? 1 : -1
+        int replacementIndex = array.size(sequences) - 1
+        while replacementIndex >= 0
+            Sequence prior = array.get(sequences, replacementIndex)
+            if prior.dir == newDirection
+                array.remove(sequences, replacementIndex)
+            replacementIndex -= 1
+        Sequence c = Sequence.new()
+        c.dir := newDirection
+        c.sweepBar := bar_index
+        c.sweepTime := time_close
+        c.sweepLevel := longSweep ? sweepLowLevel : sweepHighLevel
+        c.sweepKnownAt := longSweep ? sweepLowKnownAt : sweepHighKnownAt
+        c.sweepName := longSweep ? sweepLowName : sweepHighName
+        c.extreme := longSweep ? low : high
+        c.mssLevel := longSweep ? oppositeHigh : oppositeLow
+        c.mssLevelKnownAt := longSweep ? oppositeHighKnownAt : oppositeLowKnownAt
+        array.push(sequences, c)
+
+    int sequenceIndex = array.size(sequences) - 1
+    while sequenceIndex >= 0
+        Sequence c = array.get(sequences, sequenceIndex)
+        float plannedStop = c.extreme - c.dir * stopTicks * syminfo.mintick
+        plannedStop := math.round_to_mintick(plannedStop)
+        bool invalidSequence = c.dir == 1 ? low <= plannedStop : high >= plannedStop
+        bool removeSequence = invalidSequence or bar_index - c.sweepBar > sequenceBars
+        if not removeSequence and bar_index > c.sweepBar
+            bool structuralCross = c.dir == 1 ? close > c.mssLevel : close < c.mssLevel
+            if na(c.mssBar) and structuralCross
+                c.mssBar := bar_index
+                c.mssTime := time_close
+            bool matchingFvg = c.dir == 1 ? bullishFvg : bearishFvg
+            // A confirmed FVG can await grade/target readiness while untouched.
+            if not na(c.fvgTime) and time_close > c.fvgTime and (c.dir == 1 ? low <= c.zoneHigh : high >= c.zoneLow)
+                c.fvgTime := na
+            if not na(c.mssBar) and bar_index >= c.mssBar and matchingFvg
+                c.zoneLow := c.dir == 1 ? high[2] : high
+                c.zoneHigh := c.dir == 1 ? low : low[2]
+                c.fvgTime := time_close
+            bool matchingGrade = c.dir == 1 ? qualifyLong : qualifyShort
+            if not na(c.mssBar) and not na(c.fvgTime) and matchingGrade
+                float zoneLow = c.zoneLow
+                float zoneHigh = c.zoneHigh
+                float limitPrice = entryPolicy == "Midpoint" ? (zoneLow + zoneHigh) / 2 : c.dir == 1 ? zoneHigh : zoneLow
+                limitPrice := math.round_to_mintick(limitPrice)
+                float stopPrice = plannedStop
+                float targetPrice = na
+                string targetName = ""
+                int targetKnownAt = na
+                if c.dir == 1 and not pdhTaken and not na(pdh) and pdh > limitPrice
+                    targetPrice := pdh
+                    targetName := "PDH"
+                    targetKnownAt := previousDayKnownAt
+                if c.dir == -1 and not pdlTaken and not na(pdl) and pdl < limitPrice
+                    targetPrice := pdl
+                    targetName := "PDL"
+                    targetKnownAt := previousDayKnownAt
+                if targetPolicy == "Nearest untouched liquidity"
+                    int targetIndex = 0
+                    int targetCount = c.dir == 1 ? array.size(upperPool) : array.size(lowerPool)
+                    while targetIndex < targetCount
+                        Liquidity level = c.dir == 1 ? array.get(upperPool, targetIndex) : array.get(lowerPool, targetIndex)
+                        bool favorable = c.dir * (level.price - limitPrice) > 0
+                        bool nearer = na(targetPrice) or c.dir * (level.price - limitPrice) < c.dir * (targetPrice - limitPrice) or (level.price == targetPrice and level.knownAt > targetKnownAt)
+                        if favorable and nearer
+                            targetPrice := level.price
+                            targetKnownAt := level.knownAt
+                            targetName := c.dir == 1 ? "Execution swing high" : "Execution swing low"
+                        targetIndex += 1
+                float risk = c.dir * (limitPrice - stopPrice)
+                bool validGeometry = limitPrice > 0 and limitPrice >= zoneLow and limitPrice <= zoneHigh and risk + syminfo.mintick * 1e-9 >= syminfo.mintick and not na(targetPrice) and c.dir * (targetPrice - limitPrice) > 0
+                if validGeometry
+                    if array.size(tracked) >= maxConcurrent
+                        runtime.error("Concurrent audit limit reached. Increase limit or reduce history; no setup was silently dropped.")
+                    nextId += 1
+                    Execution s = Execution.new()
+                    s.id := nextId
+                    s.dir := c.dir
+                    s.grade := c.dir == 1 ? bullCount : bearCount
+                    s.score := s.grade
+                    s.armedBar := bar_index
+                    s.armedTime := time_close
+                    s.sweepTime := c.sweepTime
+                    s.sweepLevel := c.sweepLevel
+                    s.sweepKnownAt := c.sweepKnownAt
+                    s.sweepName := c.sweepName
+                    s.sweepExtreme := c.extreme
+                    s.mssLevel := c.mssLevel
+                    s.mssLevelKnownAt := c.mssLevelKnownAt
+                    s.mssTime := c.mssTime
+                    s.zoneLow := zoneLow
+                    s.zoneHigh := zoneHigh
+                    s.fvgTime := c.fvgTime
+                    s.entry := limitPrice
+                    s.stop := stopPrice
+                    s.target := targetPrice
+                    s.targetName := targetName
+                    s.targetKnownAt := targetKnownAt
+                    s.risk := risk
+                    s.rr := c.dir * (targetPrice - limitPrice) / risk
+                    s.tiersAtArming := "M:" + f_tierSnapshot(trendM, pendingUpM, pendingDownM) + " W:" + f_tierSnapshot(trendW, pendingUpW, pendingDownW) + " D:" + f_tierSnapshot(trendD, pendingUpD, pendingDownD) + " 4H:" + f_tierSnapshot(trend4H, pendingUp4H, pendingDown4H) + " 1H:" + f_tierSnapshot(trend1H, pendingUp1H, pendingDown1H) + " E:" + f_tierSnapshot(trendE, pendingUpE, pendingDownE)
+                    array.push(tracked, s)
+                    int gradeIndex = s.grade - 4
+                    array.set(qualified, gradeIndex, array.get(qualified, gradeIndex) + 1)
+                    latest := s
+                    if s.dir == 1
+                        armedLongGrade := s.grade
+                    else
+                        armedShortGrade := s.grade
+                    if showLevels
+                        f_draw(s)
+                        array.push(drawn, s)
+                        if array.size(drawn) > visibleSetups
+                            Execution oldest = array.shift(drawn)
+                            f_deleteDrawing(oldest)
+                    removeSequence := true
+        if removeSequence
+            array.remove(sequences, sequenceIndex)
+        sequenceIndex -= 1
+
+// Open/wait are computed from ALL concurrent records, not the last drawn N.
+array<int> waitingNow = array.new<int>(3, 0)
+array<int> openNow = array.new<int>(3, 0)
+int currentIndex = 0
+while currentIndex < array.size(tracked)
+    Execution s = array.get(tracked, currentIndex)
+    int gradeIndex = s.grade - 4
+    if s.state == 0
+        array.set(waitingNow, gradeIndex, array.get(waitingNow, gradeIndex) + 1)
+    else
+        array.set(openNow, gradeIndex, array.get(openNow, gradeIndex) + 1)
+    currentIndex += 1
+f_total(array<int> values) =>
+    array.sum(values)
+f_terminalTotal(int outcome) =>
+    array.get(terminals, outcome - 1) + array.get(terminals, 6 + outcome - 1) + array.get(terminals, 12 + outcome - 1)
+
+plotshape(armedLongGrade == 6, "A+ Limit Long", shape.labelup, location.belowbar, color.lime, text="A+ LIMIT", textcolor=color.black, size=size.tiny)
+plotshape(armedLongGrade == 5, "A Limit Long", shape.labelup, location.belowbar, color.green, text="A LIMIT", textcolor=color.white, size=size.tiny)
+plotshape(armedLongGrade == 4, "B Limit Long", shape.labelup, location.belowbar, color.teal, text="B LIMIT", textcolor=color.white, size=size.tiny)
+plotshape(armedShortGrade == 6, "A+ Limit Short", shape.labeldown, location.abovebar, color.red, text="A+ LIMIT", textcolor=color.white, size=size.tiny)
+plotshape(armedShortGrade == 5, "A Limit Short", shape.labeldown, location.abovebar, color.maroon, text="A LIMIT", textcolor=color.white, size=size.tiny)
+plotshape(armedShortGrade == 4, "B Limit Short", shape.labeldown, location.abovebar, color.orange, text="B LIMIT", textcolor=color.white, size=size.tiny)
+alertcondition(armedLongGrade > 0, "DMK qualified long limit", "Confirmed sweep/MSS/FVG long limit armed. Retest and outcome remain pending.")
+alertcondition(armedShortGrade > 0, "DMK qualified short limit", "Confirmed sweep/MSS/FVG short limit armed. Retest and outcome remain pending.")
+plot(f_total(qualified), "Strict Total", display=display.data_window)
+plot(f_total(entered), "Strict Entered", display=display.data_window)
+plot(f_total(waitingNow), "Strict WAIT", display=display.data_window)
+plot(f_total(openNow), "Strict OPEN", display=display.data_window)
+plot(f_terminalTotal(1), "Strict WIN", display=display.data_window)
+plot(f_terminalTotal(2), "Strict LOSS", display=display.data_window)
+plot(f_terminalTotal(3), "Strict BE", display=display.data_window)
+plot(f_terminalTotal(4), "Strict INVALIDATED", display=display.data_window)
+plot(f_terminalTotal(5), "Strict NOT TRIGGERED", display=display.data_window)
+plot(f_terminalTotal(6), "Strict AMBIGUOUS", display=display.data_window)
+plot(f_total(uncertainEntry), "Strict Ambiguous Entry", display=display.data_window)
+plot(array.get(qualified, 2), "A+ Qualified", display=display.data_window)
+plot(array.get(entered, 2), "A+ Entered", display=display.data_window)
+plot(array.get(waitingNow, 2), "A+ WAIT", display=display.data_window)
+plot(array.get(openNow, 2), "A+ OPEN", display=display.data_window)
+plot(array.get(terminals, 12), "A+ WIN", display=display.data_window)
+plot(array.get(terminals, 13), "A+ LOSS", display=display.data_window)
+plot(array.get(terminals, 14), "A+ BE", display=display.data_window)
+plot(array.get(terminals, 15), "A+ INVALIDATED", display=display.data_window)
+plot(array.get(terminals, 16), "A+ NOT TRIGGERED", display=display.data_window)
+plot(array.get(terminals, 17), "A+ AMBIGUOUS", display=display.data_window)
+plot(array.get(uncertainEntry, 2), "A+ Ambiguous Entry", display=display.data_window)
+plot(latest.entry, "Setup Entry", display=display.data_window)
+plot(latest.stop, "Setup SL", display=display.data_window)
+plot(latest.target, "Setup Liquidity Target", display=display.data_window)
+plot(latest.risk, "Setup Risk Price", display=display.data_window)
+plot(latest.risk / syminfo.mintick, "Setup Risk Ticks", display=display.data_window)
+plot(100 * latest.risk / latest.entry, "Setup Risk Quote Percent", display=display.data_window)
+plot(latest.rr, "Setup Target RR", display=display.data_window)
+plot(latest.score, "Setup Aligned Tiers (of 6)", display=display.data_window)
+plot(latest.triggered == 0 ? na : latest.mfeLower, "Setup MFE Lower R", display=display.data_window)
+plot(latest.triggered == 0 ? na : latest.mfeUpper, "Setup MFE Upper R", display=display.data_window)
+
+f_trendText(int t, bool pu, bool pd) =>
+    na(t) ? "Waiting" : pu ? "Bear / CH↑" : pd ? "Bull / CH↓" : t == 1 ? "Bull" : t == -1 ? "Bear" : "Range"
+f_tierColor(int t, bool pu, bool pd) =>
+    pu or pd ? color.orange : t == 1 ? color.lime : t == -1 ? color.red : color.silver
+var table dash = table.new(position.top_right, 2, 11, bgcolor=color.new(color.black, 12))
+if showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "DMK Execution", text_color=color.white)
+    table.cell(dash, 1, 0, "Sweep/MSS/FVG/retest", text_color=color.white)
+    table.cell(dash, 0, 1, "Monthly", text_color=color.white)
+    table.cell(dash, 1, 1, f_trendText(trendM, pendingUpM, pendingDownM), text_color=f_tierColor(trendM, pendingUpM, pendingDownM))
+    table.cell(dash, 0, 2, "Weekly", text_color=color.white)
+    table.cell(dash, 1, 2, f_trendText(trendW, pendingUpW, pendingDownW), text_color=f_tierColor(trendW, pendingUpW, pendingDownW))
+    table.cell(dash, 0, 3, "Daily", text_color=color.white)
+    table.cell(dash, 1, 3, f_trendText(trendD, pendingUpD, pendingDownD), text_color=f_tierColor(trendD, pendingUpD, pendingDownD))
+    table.cell(dash, 0, 4, "4H", text_color=color.white)
+    table.cell(dash, 1, 4, f_trendText(trend4H, pendingUp4H, pendingDown4H), text_color=f_tierColor(trend4H, pendingUp4H, pendingDown4H))
+    table.cell(dash, 0, 5, "1H", text_color=color.white)
+    table.cell(dash, 1, 5, f_trendText(trend1H, pendingUp1H, pendingDown1H), text_color=f_tierColor(trend1H, pendingUp1H, pendingDown1H))
+    table.cell(dash, 0, 6, "Execution", text_color=color.white)
+    table.cell(dash, 1, 6, f_trendText(trendE, pendingUpE, pendingDownE), text_color=f_tierColor(trendE, pendingUpE, pendingDownE))
+    table.cell(dash, 0, 7, "Min / aligned", text_color=color.white)
+    table.cell(dash, 1, 7, str.tostring(minAligned) + " / " + str.tostring(bullCount) + ":" + str.tostring(bearCount), text_color=color.white)
+    table.cell(dash, 0, 8, "Drawn / qualified", text_color=color.white)
+    table.cell(dash, 1, 8, str.tostring(array.size(drawn)) + " / " + str.tostring(f_total(qualified)), text_color=color.white)
+    table.cell(dash, 0, 9, "Evidence timezone", text_color=color.white)
+    table.cell(dash, 1, 9, auditTimezone, text_color=color.white)
+    table.cell(dash, 0, 10, "Model", text_color=color.white)
+    table.cell(dash, 1, 10, "OHLC; no costs/fills", text_color=color.white)
+var table audit = table.new(position.bottom_right, 4, 11, bgcolor=color.new(color.black, 12))
+if showDashboard and barstate.islast
+    table.cell(audit, 0, 0, "All qualified", text_color=color.white)
+    table.cell(audit, 1, 0, "A+", text_color=color.white)
+    table.cell(audit, 2, 0, "A", text_color=color.white)
+    table.cell(audit, 3, 0, "B", text_color=color.white)
+    table.cell(audit, 0, 1, "Total", text_color=color.white)
+    table.cell(audit, 0, 2, "Entered", text_color=color.white)
+    table.cell(audit, 0, 3, "WAIT", text_color=color.white)
+    table.cell(audit, 0, 4, "OPEN", text_color=color.white)
+    table.cell(audit, 0, 5, "WIN", text_color=color.lime)
+    table.cell(audit, 0, 6, "LOSS", text_color=color.red)
+    table.cell(audit, 0, 7, "BE", text_color=color.white)
+    table.cell(audit, 0, 8, "INVALIDATED", text_color=color.orange)
+    table.cell(audit, 0, 9, "NOT TRIGGERED", text_color=color.white)
+    table.cell(audit, 0, 10, "AMBIGUOUS", text_color=color.orange)
+    for column = 1 to 3
+        int index = 3 - column
+        table.cell(audit, column, 1, str.tostring(array.get(qualified, index)), text_color=color.white)
+        table.cell(audit, column, 2, str.tostring(array.get(entered, index)), text_color=color.white)
+        table.cell(audit, column, 3, str.tostring(array.get(waitingNow, index)), text_color=color.white)
+        table.cell(audit, column, 4, str.tostring(array.get(openNow, index)), text_color=color.white)
+        for outcome = 1 to 6
+            table.cell(audit, column, outcome + 4, str.tostring(array.get(terminals, index * 6 + outcome - 1)), text_color=color.white)

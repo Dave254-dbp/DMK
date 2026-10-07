@@ -1,0 +1,20 @@
+{
+  "name": "dmk-indicator",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "run": "node scripts/run-indicator.mjs",
+    "audit:setups": "node scripts/audit-setups.mjs",
+    "audit:catalog": "node scripts/audit-catalog.mjs",
+    "audit:structural": "node scripts/audit-structural.mjs",
+    "run:execution": "node scripts/run-execution.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "pinets": "0.11.0"
+  }
+}
